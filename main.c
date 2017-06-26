@@ -66,7 +66,6 @@ void timer_restart() {
 #define STATE_WAITING                   0
 #define STATE_PREAMBLE_START            1
 #define STATE_PREAMBLE_END              2
-#define STATE_PREAMBLE_COMPLETE         3
 #define STATE_MANCH_DECODING            4
 #define STATE_MANCH_SAME_CONFIRM        5
 
@@ -254,12 +253,6 @@ void decode_manchester() {
       // not within expected pulse width
       reset_state();
     }
-    break;
-
-  case STATE_PREAMBLE_COMPLETE:
-    // preamble is complete, start decoding
-    state = STATE_MANCH_DECODING;
-    set_ic_edge(RISE);
     break;
 
   case STATE_MANCH_DECODING:
