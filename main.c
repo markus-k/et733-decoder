@@ -23,6 +23,62 @@ void uart_putc(uint8_t v) {
   UDR = v;
 }
 
+
+/************************************************/
+/* spi slave                                    */
+
+volatile struct spi_transfer {
+  uint8_t *buf;
+  uint8_t len;
+  uint8_t *cur;
+} spi_transfer;
+
+void spi_setup() {
+  // three wire mode, external positive edge clock
+  USICR |= (1 << USIWM0) | (1 << USICS1);
+
+  DDRB |= (1 << PB6); // DO as output
+  DDRB &= ~(1 << PB5); // DI as input
+  DDRB &= ~(1 << PB7); // USCK as input
+
+  DDRD &= ~(1 << PD2); // CS as input
+  DDRD |= (1 << PD4);
+
+  // enable INT0 on any edge
+  MCUCR |= (1 << ISC00);
+  GIMSK |= (1 << INT0);
+}
+
+#define spi_write_next() do { USIDR = *spi_transfer.cur++; } while (0)
+
+ISR(INT0_vect) {
+  if (PIND & (1 << PD2)) {
+    // end of transmission
+    // turn off ovf interrupt
+    USICR &= ~(1 << USIOIE);
+  } else {
+    // start of a transmission
+    // turn on ovf interrupt
+    USICR |= (1 << USIOIE);
+    USISR |= (1 << USIOIF); // clear ovf flag
+
+    spi_transfer.cur = spi_transfer.buf;
+    spi_write_next();
+  }
+}
+
+ISR(USI_OVERFLOW_vect) {
+  PORTD ^= (1 << PD4);
+  if (spi_transfer.cur < spi_transfer.buf + spi_transfer.len) {
+    spi_write_next();
+  } else {
+    USIDR = 0;
+  }
+
+  USISR |= (1 << USIOIF); // clear ovf flag
+}
+
+
 /************************************************/
 /* timer utils                                  */
 
@@ -69,6 +125,15 @@ void timer_restart() {
 #define STATE_MANCH_DECODING            4
 #define STATE_MANCH_SAME_CONFIRM        5
 
+#define BBQTEMP_FLAG_STARTING           0
+
+struct bbqtemp_packet {
+  uint16_t magic;
+  uint16_t temp1;
+  uint16_t temp2;
+  uint8_t flags;
+};
+
 // last input capture time
 volatile uint16_t t_ic = 0;
 
@@ -93,7 +158,11 @@ volatile uint8_t state = 0;
 // preamble cycle counter
 volatile uint8_t preamble_count = 0;
 
+// packet for sending out
+volatile struct bbqtemp_packet last_packet;
+
 void reset_state() {
+  // reset everything for the decoder
   state  = STATE_WAITING;
   had_edge = 0;
   preamble_count = 0;
@@ -123,7 +192,7 @@ ISR(TIMER1_COMPA_vect) {
 #endif
 
 // roughly equal function
-// a > 0.7b && a < 1.3b
+// a > 0.75b && a < 1.25b
 uint8_t t_eq(uint16_t a, uint16_t b) {
   uint16_t margin = (b >> 2) + (b >> 3);
   return a > (b - margin) && a < (b + margin);
@@ -149,7 +218,6 @@ void store_bit() {
 
   buf_i++;
 }
-
 
 uint8_t decode_to_quatenary(uint8_t quat) {
   switch (quat) {
@@ -204,6 +272,12 @@ void decode_et733() {
   uint16_t temp1 = decode_10bit_value_lower(ptr);
   ptr += 2;
   uint16_t temp2 = decode_10bit_value_upper(ptr);
+
+  // the checksum is ignored for now
+
+  last_packet.temp1 = temp1;
+  last_packet.temp2 = temp2;
+  last_packet.flags = (starting ? (1 << BBQTEMP_FLAG_STARTING) : 0);
 
   uart_putc(temp1 >> 8);
   uart_putc(temp1 & 0xFF);
@@ -288,9 +362,9 @@ void decode_manchester() {
   manch_dbg(state);
 
   if (buf_i >= 104) {
-    manch_dbg(0xEE);
+    manch_dbg(0xEE); // some byte for easier triggering
     for (uint8_t i = 0; i < RXBUF_SIZE; i++) {
-      uart_putc(buf[i]);
+      manch_dbg(buf[i]);
     }
 
     decode_et733();
@@ -300,7 +374,13 @@ void decode_manchester() {
 }
 
 int main() {
+  last_packet.magic = 0xE733;
+
   uart_setup();
+  spi_setup();
+
+  spi_transfer.buf = (uint8_t *)&last_packet;
+  spi_transfer.len = sizeof(struct bbqtemp_packet);
 
   timer_setup();
 
