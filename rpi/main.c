@@ -34,8 +34,8 @@
 #define BBQ_READOUT_FLAG_STARTING       0
 struct bbq_readout {
   uint16_t magic;
-  uint16_t temp1;
-  uint16_t temp2;
+  int16_t temp1;
+  int16_t temp2;
   uint8_t flags;
 };
 
@@ -153,10 +153,10 @@ void read_readout(int spi_fd, struct bbq_readout *readout) {
   spi_receive(spi_fd, sizeof(struct bbq_readout), rx_buf);
 
   readout->magic = rx_buf[0] | (uint16_t)rx_buf[1] << 8;
-  readout->temp1 = rx_buf[2] | (uint16_t)rx_buf[3] << 8;
-  readout->temp2 = rx_buf[4] | (uint16_t)rx_buf[5] << 8;
+  readout->temp1 = (rx_buf[2] | (uint16_t)rx_buf[3] << 8) - 532;
+  readout->temp2 = (rx_buf[4] | (uint16_t)rx_buf[5] << 8) - 532;
   readout->flags = rx_buf[6];
-  printf("%x\n", readout->magic);
+  printf("Magic: %x\n", readout->magic);
 }
 
 void publish_readout(struct mosquitto *mosq, struct bbq_readout *readout) {
