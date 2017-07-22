@@ -131,6 +131,7 @@ struct bbqtemp_packet {
   uint16_t magic;
   uint16_t temp1;
   uint16_t temp2;
+  uint16_t sender_id;
   uint8_t flags;
 };
 
@@ -146,9 +147,12 @@ volatile uint8_t last_bit = 0;
 
 // rx buffer
 #define RXBUF_SIZE                      13
-volatile uint8_t buf[RXBUF_SIZE];
-// current bit in buffer
-volatile uint8_t buf_i = 0;
+volatile struct {
+  uint8_t buf[RXBUF_SIZE];
+
+  // current bit in buffer
+  uint8_t buf_i;
+} rf_receive;
 
 // flag for isr
 volatile uint8_t had_edge = 0;
@@ -166,7 +170,7 @@ void reset_state() {
   state  = STATE_WAITING;
   had_edge = 0;
   preamble_count = 0;
-  buf_i = 0;
+  rf_receive.buf_i = 0;
   last_bit = 1;
   set_ic_edge(RISE);
 }
@@ -199,8 +203,8 @@ uint8_t t_eq(uint16_t a, uint16_t b) {
 }
 
 void store_bit() {
-  uint8_t i = buf_i >> 3; // div 8
-  uint8_t bit = 7 - (buf_i - (i << 3));
+  uint8_t i = rf_receive.buf_i >> 3; // div 8
+  uint8_t bit = 7 - (rf_receive.buf_i - (i << 3));
 
   if (i > RXBUF_SIZE) {
     // buffer overflow, stop
@@ -208,19 +212,20 @@ void store_bit() {
   }
 
   if (last_bit) {
-    buf[i] |= (1 << bit);
+    rf_receive.buf[i] |= (1 << bit);
   } else {
-    buf[i] &= ~(1 << bit);
+    rf_receive.buf[i] &= ~(1 << bit);
   }
 
   manch_dbg((last_bit << 4) | bit);
   manch_dbg(i);
 
-  buf_i++;
+  rf_receive.buf_i++;
 }
 
-uint8_t decode_to_quatenary(uint8_t quat) {
+uint8_t decode_quatenary_value(uint8_t quat) {
   switch (quat) {
+  default: // fallthrough
   case 0x5:
     return 0;
   case 0x6:
@@ -229,54 +234,89 @@ uint8_t decode_to_quatenary(uint8_t quat) {
     return 2;
   case 0xA:
     return 3;
-  default:
-    return 0;
   }
 }
 
-uint16_t decode_10bit_value_lower(uint8_t *ptr) {
-  uint16_t res = 0;
+void decode_quatenary_coding(uint8_t *out) {
+  uint8_t i;
 
-  res |= (uint16_t)decode_to_quatenary(*ptr >> 4) << 8;
-  res |= (uint16_t)decode_to_quatenary((*ptr++) & 0x0F) << 6;
-  res |= (uint16_t)decode_to_quatenary(*ptr >> 4) << 4;
-  res |= (uint16_t)decode_to_quatenary((*ptr++) & 0x0F) << 2;
-  res |= (uint16_t)decode_to_quatenary(*ptr >> 4);
+  for (i = 0; i < RXBUF_SIZE; i++) {
+    uint8_t val = rf_receive.buf[i];
+    uint8_t nibble = (decode_quatenary_value(val >> 4) << 2) |
+      decode_quatenary_value(val & 0x0F);
 
-  return res;
+    if ((i & 1) == 0) {
+      // upper nibble
+      nibble <<= 4;
+    }
+
+    out[i >> 1] |= nibble;
+  }
 }
 
-uint16_t decode_10bit_value_upper(uint8_t *ptr) {
-  uint16_t res = 0;
+// checksum calculation based on Nibbler's (Sebastians) work
+// see https://forums.adafruit.com/viewtopic.php?f=8&t=25414&sid=e1775df908194d56692c6ad9650fdfb2&start=15#p321384
+uint16_t calculate_checksum(uint8_t *buf) {
+  // initial value of linear feedback shift register
+  uint16_t mask = 0x3331;
+  uint16_t cksum = 0x0;
+  uint8_t i;
 
-  res |= (uint16_t)decode_to_quatenary((*ptr++) & 0x0F) << 8;
-  res |= (uint16_t)decode_to_quatenary(*ptr >> 4) << 6;
-  res |= (uint16_t)decode_to_quatenary((*ptr++) & 0x0F) << 4;
-  res |= (uint16_t)decode_to_quatenary(*ptr >> 4) << 2;
-  res |= (uint16_t)decode_to_quatenary(*ptr & 0x0F);
+  uint32_t data = ((uint32_t)buf[0] & 0xF) << 20 |
+    (uint32_t)buf[1] << 12 |
+    (uint32_t)buf[2] << 4 |
+    ((uint32_t)buf[3] & 0xF0) >> 4;
 
-  return res;
+  for (i = 0; i < 24; i++) {
+    if ((data >> i) & 0x01) {
+      // data bit at current position is "1"
+      // do XOR with mask
+      cksum ^= mask;
+    }
+
+    uint8_t msb = (mask >> 15) & 0x1;
+    mask <<= 1;
+    if (msb == 1) {
+      // msb is set, toggle pattern for feedback bits
+      mask ^= 0x1021;
+    }
+  }
+
+  return cksum;
 }
 
 void decode_et733() {
-  uint8_t *ptr = (uint8_t *)buf;
-  uint8_t starting = 0;
+  uint8_t buf[RXBUF_SIZE / 2 + 1];
+  uint8_t i;
 
-  if (!(*ptr++ == 0xAA && *ptr++ == 0x99 && *ptr++ == 0x95)) {
+  i = sizeof(buf);
+  while (i--) {
+    buf[i] = 0;
+  }
+  decode_quatenary_coding(buf);
+
+  for (i = 0; i < sizeof(buf); i++) {
+    uart_putc(buf[i]);
+  }
+
+  if (!(buf[0] == 0xFA && buf[1] >> 4 == 0x8)) {
     // invalid header
     return;
   }
 
-  starting = *ptr++ == 0x6A;
+  uint8_t starting = (buf[1] & 0xF) == 0x7;
 
-  uint16_t temp1 = decode_10bit_value_lower(ptr);
-  ptr += 2;
-  uint16_t temp2 = decode_10bit_value_upper(ptr);
+  uint16_t temp1 = (((uint16_t)buf[2] << 8) | buf[3]) >> 6;
+  uint16_t temp2 = (((uint16_t)buf[3] & 0x3F) << 4) | (buf[4] >> 4);
 
-  // the checksum is ignored for now
+  uint16_t orig_cksum = (uint16_t)(buf[4] & 0xF) << 12 | (uint16_t)buf[5] << 4 | buf[6] >> 4;
+
+  uint16_t cksum = calculate_checksum(&buf[1]);
+  uint16_t sender_id = orig_cksum ^ cksum;
 
   last_packet.temp1 = temp1;
   last_packet.temp2 = temp2;
+  last_packet.sender_id = sender_id;
   last_packet.flags = (starting ? (1 << BBQTEMP_FLAG_STARTING) : 0);
 
   uart_putc(temp1 >> 8);
@@ -284,6 +324,12 @@ void decode_et733() {
 
   uart_putc(temp2 >> 8);
   uart_putc(temp2 & 0xFF);
+
+  uart_putc(sender_id >> 8);
+  uart_putc(sender_id & 0xFF);
+
+  uart_putc(cksum >> 8);
+  uart_putc(cksum & 0xFF);
 
   uart_putc(starting);
 }
@@ -361,10 +407,10 @@ void decode_manchester() {
   manch_dbg(preamble_count);
   manch_dbg(state);
 
-  if (buf_i >= 104) {
+  if (rf_receive.buf_i >= 104) {
     manch_dbg(0xEE); // some byte for easier triggering
     for (uint8_t i = 0; i < RXBUF_SIZE; i++) {
-      manch_dbg(buf[i]);
+      manch_dbg(rf_receive.buf[i]);
     }
 
     decode_et733();
