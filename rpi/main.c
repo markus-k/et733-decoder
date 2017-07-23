@@ -21,8 +21,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/timerfd.h>
@@ -36,12 +38,14 @@ struct bbq_readout {
   uint16_t magic;
   int16_t temp1;
   int16_t temp2;
+  uint16_t sender_id;
   uint8_t flags;
 };
 
 struct bbq_conf {
   char *mqtt_host;
   uint16_t mqtt_port;
+  char *mqtt_topic;
 };
 
 volatile sig_atomic_t sigint_received = 0;
@@ -100,7 +104,7 @@ void set_timer_interval(int fd, int interval) {
 void setup_timer(int *fd) {
   *fd = timerfd_create(CLOCK_REALTIME, 0);
 
-  set_timer_interval(*fd, 5);
+  set_timer_interval(*fd, 1);
 }
 
 void destroy_timer(int fd) {
@@ -155,35 +159,104 @@ void read_readout(int spi_fd, struct bbq_readout *readout) {
   readout->magic = rx_buf[0] | (uint16_t)rx_buf[1] << 8;
   readout->temp1 = (rx_buf[2] | (uint16_t)rx_buf[3] << 8) - 532;
   readout->temp2 = (rx_buf[4] | (uint16_t)rx_buf[5] << 8) - 532;
-  readout->flags = rx_buf[6];
+  readout->sender_id = rx_buf[6] | (uint16_t)rx_buf[7] << 8;
+  readout->flags = rx_buf[8];
   printf("Magic: %x\n", readout->magic);
 }
 
-void publish_readout(struct mosquitto *mosq, struct bbq_readout *readout) {
-  char buf[8];
-  int bytes;
+char *make_topic(struct bbq_conf *conf, const char *name) {
+  char *res = malloc(strlen(conf->mqtt_topic) + strlen(name) + 1);
 
-  bytes = sprintf(buf, "%d", readout->temp1);
-  mosquitto_publish(mosq, NULL, "temp1", bytes, buf, 0, 1);
-  bytes = sprintf(buf, "%d", readout->temp2);
-  mosquitto_publish(mosq, NULL, "temp2", bytes, buf, 0, 1);
+  strcpy(res, conf->mqtt_topic);
+  strcat(res, name);
+
+  return res;
 }
 
-void do_readout(int spi_fd, struct mosquitto *mosq) {
+void publish_readout(struct bbq_conf *conf, struct mosquitto *mosq, struct bbq_readout *readout) {
+  char buf[8];
+  char *topic;
+  int bytes;
+
+  topic = make_topic(conf, "temp1");
+  bytes = sprintf(buf, "%d", readout->temp1);
+  mosquitto_publish(mosq, NULL, topic, bytes, buf, 0, 1);
+  free(topic);
+
+  topic = make_topic(conf, "temp2");
+  bytes = sprintf(buf, "%d", readout->temp2);
+  mosquitto_publish(mosq, NULL, topic, bytes, buf, 0, 1);
+  free(topic);
+}
+
+void do_readout(struct bbq_conf *conf, int spi_fd, struct mosquitto *mosq) {
   struct bbq_readout readout;
 
   read_readout(spi_fd, &readout);
 
-  publish_readout(mosq, &readout);
+  publish_readout(conf, mosq, &readout);
+}
+
+void print_help(int argc, char **argv) {
+  printf("Usage: %s [OPTIONS]\n"
+	 "BBQ thermometer to mqtt bridge\n"
+	 "\n"
+	 "  -h, --help                  print this help\n"
+	 "  -H, --mqtt-host HOST        MQTT host\n"
+	 "  -p, --mqtt-port PORT        MQTT port\n"
+	 "  -t, --mqtt-topic PATH       MQTT topic prefix\n"
+	 , argv[0]);
+}
+
+void parse_opts(int argc, char **argv, struct bbq_conf *conf) {
+  int opt, opt_i;
+  static struct option long_opts[] = {
+    {"help",       no_argument,       0, 'h'},
+    {"mqtt-host",  required_argument, 0, 'H'},
+    {"mqtt-port",  required_argument, 0, 'p'},
+    {"mqtt-topic", required_argument, 0, 't'},
+    {0,            0,                 0,  0 }
+  };
+  const char *short_opts = "hH:p:t:";
+
+  while ((opt = getopt_long(argc, argv, short_opts, long_opts, &opt_i)) != -1) {
+    switch (opt) {
+    case 'h':
+      print_help(argc, argv);
+      exit(0);
+      break;
+    case 'H':
+      conf->mqtt_host = realloc(conf->mqtt_host, strlen(optarg) + 1);
+      strcpy(conf->mqtt_host, optarg);
+      break;
+    case 'p':
+      conf->mqtt_port = atoi(optarg);
+      break;
+    case 't':
+      conf->mqtt_topic = realloc(conf->mqtt_topic, strlen(optarg) + 1);
+      strcpy(conf->mqtt_topic, optarg);
+      break;
+    default:
+      print_help(argc, argv);
+      exit(1);
+    }
+  }
 }
 
 int main(int argc, char **argv) {
+  struct bbq_conf conf;
   struct mosquitto *mosq = NULL;
   int spi_fd;
   int timer_fd;
 
+  conf.mqtt_host = strdup("localhost");
+  conf.mqtt_port = 1883;
+  conf.mqtt_topic = strdup("");
+
   struct sigaction int_handler = { .sa_handler = handle_sigint };
   sigaction(SIGINT, &int_handler, 0);
+
+  parse_opts(argc, argv, &conf);
 
   mosquitto_lib_init();
   mosq = mosquitto_new(NULL, true, NULL);
@@ -200,12 +273,12 @@ int main(int argc, char **argv) {
 
   setup_timer(&timer_fd);
 
-  mosquitto_connect(mosq, "localhost", 1883, 10);
+  mosquitto_connect(mosq, conf.mqtt_host, conf.mqtt_port, 10);
 
   mosquitto_loop_start(mosq);
 
   do {
-    do_readout(spi_fd, mosq);
+    do_readout(&conf, spi_fd, mosq);
   } while (!timer_wait(timer_fd));
 
   mosquitto_disconnect(mosq);
@@ -218,6 +291,9 @@ int main(int argc, char **argv) {
 
   mosquitto_destroy(mosq);
   mosquitto_lib_cleanup();
+
+  free(conf.mqtt_host);
+  free(conf.mqtt_topic);
 
   return 0;
 }
