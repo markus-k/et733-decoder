@@ -62,6 +62,11 @@ ISR(INT0_vect) {
     USICR |= (1 << USIOIE);
     USISR |= (1 << USIOIF); // clear ovf flag
 
+    PORTD &= ~(1 << PD4);
+
+    // set the 4 bit counter to 0
+    USISR &= ~0x0F;
+
     spi_transfer.cur = spi_transfer.buf;
     spi_write_next();
   }
